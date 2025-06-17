@@ -1,0 +1,166 @@
+# -*- coding: utf-8 -*-
+"""
+import pandas as pd
+import numpy as np
+import warnings
+from sklearn.exceptions import UndefinedMetricWarning
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+
+from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report
+
+from google.colab import drive
+
+# Ignore specific warnings for cleaner output
+warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+print("Libraries imported successfully.")
+
+def load_and_prepare_data(file_path):
+    """Loads and prepares the dataset, returning X, y, and groups for LOSO."""
+    try:
+        df = pd.read_csv(file_path)
+        print(f"Dataset '{file_path}' loaded successfully from Google Drive.")
+        
+        if 'gender' in df.columns:
+            df = df.drop(columns=['gender'])
+            print("Column 'gender' removed.")
+
+    except FileNotFoundError:
+        print(f"ERROR: The file '{file_path}' was not found.")
+        print("Please ensure the path is correct and the file exists in your Google Drive.")
+        return None, None, None
+
+    X = df.drop(columns=['id', 'class']).values
+    y = df['class'].values
+    groups = df['id'].values 
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    print(f"Dataset ready: {X_scaled.shape[0]} samples, {X_scaled.shape[1]} features.")
+    print(f"Number of unique subjects for LOSO: {len(np.unique(groups))}")
+    return X_scaled, y, groups
+
+def define_models(input_dim):
+    """Defines the architectures for all models used in the pipeline."""
+    encoding_dim = 64
+    input_layer = Input(shape=(input_dim,))
+    encoder_layer = Dense(encoding_dim, activation='relu')(input_layer)
+    decoder_layer = Dense(input_dim, activation='sigmoid')(encoder_layer)
+    autoencoder = Model(input_layer, decoder_layer, name="Autoencoder")
+    encoder = Model(input_layer, encoder_layer, name="Encoder")
+    autoencoder.compile(optimizer='adam', loss='mean_squared_error')
+
+    lda = LDA(solver='eigen', shrinkage='auto', n_components=1)
+    
+    base_classifiers = {
+        'RandomForest': RandomForestClassifier(random_state=42),
+        'SVC_rbf': SVC(kernel='rbf', probability=True, random_state=42),
+        'LogisticRegression': LogisticRegression(max_iter=1000, random_state=42, solver='liblinear')
+    }
+
+    meta_classifier = LogisticRegression(random_state=42)
+
+    models = {
+        'autoencoder': autoencoder,
+        'encoder': encoder,
+        'lda': lda,
+        'base_classifiers': base_classifiers,
+        'meta_classifier': meta_classifier
+    }
+    return models
+
+def evaluate_performance(y_true, y_pred, y_proba, model_name):
+    """Calculates and prints comprehensive performance metrics."""
+    accuracy = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, average='weighted')
+    
+    if len(np.unique(y_true)) > 1:
+        auc = roc_auc_score(y_true, y_proba)
+    else:
+        auc = float('nan')
+
+    print(f"\n--- Performance: {model_name} ---")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"F1-Score (Weighted): {f1:.4f}")
+    print(f"ROC AUC: {auc:.4f}")
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_true, y_pred))
+    print("\nClassification Report:")
+    print(classification_report(y_true, y_pred, digits=4))
+    print("-" * (20 + len(model_name)))
+
+def run_loso_stacking_pipeline(X, y, groups, models):
+    logo = LeaveOneGroupOut()
+    num_subjects = len(np.unique(groups))
+    y_true_all = []
+    test_preds_no_reduction = {name: [] for name in models['base_classifiers']}
+    test_preds_autoencoder = {name: [] for name in models['base_classifiers']}
+    test_preds_lda = {name: [] for name in models['base_classifiers']}
+
+    for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups)):
+        print(f"Processing Subject (Fold) {fold + 1}/{num_subjects}...")
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        y_true_all.extend(y_test)
+
+        # Pipeline 1: No Feature Reduction
+        X_train_rep, X_test_rep = X_train, X_test
+        for clf_name, clf in models['base_classifiers'].items():
+            clf.fit(X_train_rep, y_train)
+            test_proba = clf.predict_proba(X_test_rep)[:, 1]
+            test_preds_no_reduction[clf_name].extend(test_proba)
+
+        # Pipeline 2: Autoencoder Feature Reduction
+        models['autoencoder'].fit(X_train, X_train, epochs=25, batch_size=32, verbose=0)
+        X_train_rep = models['encoder'].predict(X_train, verbose=0)
+        X_test_rep = models['encoder'].predict(X_test, verbose=0)
+        for clf_name, clf in models['base_classifiers'].items():
+            clf.fit(X_train_rep, y_train)
+            test_proba = clf.predict_proba(X_test_rep)[:, 1]
+            test_preds_autoencoder[clf_name].extend(test_proba)
+
+        # Pipeline 3: LDA Feature Reduction
+        X_train_rep = models['lda'].fit_transform(X_train, y_train)
+        X_test_rep = models['lda'].transform(X_test)
+        for clf_name, clf in models['base_classifiers'].items():
+            clf.fit(X_train_rep, y_train)
+            test_proba = clf.predict_proba(X_test_rep)[:, 1]
+            test_preds_lda[clf_name].extend(test_proba)
+            
+    print("\n--- Final Evaluation of Ensemble Stacking Pipelines ---")
+    y_true_all = np.array(y_true_all)
+    all_pipelines = [
+        ("Ensemble Stacking (No Reduction)", test_preds_no_reduction),
+        ("Ensemble Stacking (Autoencoder)", test_preds_autoencoder),
+        ("Ensemble Stacking (LDA)", test_preds_lda)
+    ]
+
+    for model_name, preds_dict in all_pipelines:
+        meta_features = pd.DataFrame(preds_dict)
+        models['meta_classifier'].fit(meta_features, y_true_all)
+        y_stack_pred = models['meta_classifier'].predict(meta_features)
+        y_stack_proba = models['meta_classifier'].predict_proba(meta_features)[:, 1]
+        evaluate_performance(y_true_all, y_stack_pred, y_stack_proba, model_name)
+
+
+if __name__ == '__main__':
+
+    print("Mounting Google Drive...")
+    drive.mount('/content/drive')
+    print("Drive mounted successfully.")
+
+ 
+    file_path = '/content/drive/MyDrive/pd_speech_features.csv'
+    X_scaled, y, groups = load_and_prepare_data(file_path)
+
+    if X_scaled is not None:
+        models = define_models(input_dim=X_scaled.shape[1])
+        run_loso_stacking_pipeline(X_scaled, y, groups, models)
