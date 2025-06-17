@@ -1,0 +1,2 @@
+# otimiza-o_Parkinson
+DISPONIBILIZAÇÃO ANÔNIMA DO CÓDIGO E DATASET
